@@ -99,14 +99,17 @@ class MPD
   def connect(callbacks = nil)
     raise ConnectionError, 'Already connected!' if connected?
 
+    socket = File.exist?(@hostname) ? UNIXSocket.new(@hostname) : TCPSocket.new(@hostname, @port)
+
     # by protocol, we need to get a 'OK MPD <version>' reply
     # should we fail to do so, the connection was unsuccessful
     unless response = socket.gets
       reset_vars
-      raise ConnectionError, 'Unable to connect (possibly too many connections open)'
+      raise ConnectionError, 'Unable to connect'
     end
 
-    authenticate
+    authenticate(socket)
+    @socket = socket
     @version = response.chomp.gsub('OK MPD ', '') # Read the version
 
     if callbacks
@@ -166,8 +169,8 @@ class MPD
     send_command :password, pass
   end
 
-  def authenticate
-    send_command(:password, @password) if @password
+  def authenticate(socket)
+    send_command_raw(socket, :password, [@password]) if @password
   end
 
   # Ping the server.
@@ -186,18 +189,22 @@ class MPD
   # @return (see #handle_server_response)
   # @raise [MPDError] if the command failed.
   def send_command(command, *args)
-    raise ConnectionError, "Not connected to the server!" unless socket
+    raise ConnectionError, "Not connected to the server!" unless @socket
 
     @mutex.synchronize do
       begin
-        socket.puts convert_command(command, *args)
-        response = handle_server_response
-        return parse_response(command, response)
+        send_command_raw(@socket, command, args)
       rescue Errno::EPIPE, ConnectionError
         reconnect
         retry
       end
     end
+  end
+
+  def send_command_raw(socket, command, args)
+    socket.puts convert_command(command, *args)
+    response = handle_server_response(socket)
+    return parse_response(command, response)
   end
 
 private
@@ -250,7 +257,7 @@ private
   # @return (see Parser#build_response)
   # @return [true] If "OK" is returned.
   # @raise [MPDError] If an "ACK" is returned.
-  def handle_server_response
+  def handle_server_response(socket)
     msg = ''
     while true
       case line = socket.gets
@@ -269,10 +276,6 @@ private
     return msg unless error
     err = error.match(/^ACK \[(?<code>\d+)\@(?<pos>\d+)\] \{(?<command>.*)\} (?<message>.+)$/)
     raise SERVER_ERRORS[err[:code].to_i], "[#{err[:command]}] #{err[:message]}"
-  end
-
-  def socket
-    @socket ||= File.exist?(@hostname) ? UNIXSocket.new(@hostname) : TCPSocket.new(@hostname, @port)
   end
 
   SERVER_ERRORS = {
